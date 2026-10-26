@@ -36,6 +36,35 @@ def _skip(reason: str) -> None:
     raise unittest.SkipTest(reason)
 
 
+def _gpu_backend_info(device: str) -> tuple[str, str, str]:
+    saved_env = os.environ.get("CLAP_BACKEND")
+
+    try:
+        os.environ.pop("CLAP_BACKEND", None)
+        torch_paras._C.clap_dnn_reset_stats()
+
+        x = torch.ones((2, 4), dtype=torch.float32, device=device)
+        _ = torch.sigmoid(x).cpu()
+
+        backend = torch_paras._C.clap_dnn_last_backend().lower()
+    finally:
+        torch_paras._C.clap_dnn_reset_stats()
+
+        if saved_env is not None:
+            os.environ["CLAP_BACKEND"] = saved_env
+        else:
+            os.environ.pop("CLAP_BACKEND", None)
+
+    if "cudnn" in backend:
+        return "CUDA", "cuDNN", "-cuda"
+
+    if "miopen" in backend:
+        return "ROCM", "MIOpen", "-rocm"
+
+    _skip(f"unsupported CLAP-DNN GPU backend: {backend}")
+    raise AssertionError("unreachable")
+
+
 def _ensure_onednn_loaded() -> bool:
     try:
         ctypes.CDLL("libdnnl.so", mode=ctypes.RTLD_GLOBAL)
@@ -58,6 +87,7 @@ def _run_interleaved_cached_tensors(
     assert torch_paras._C.clap_dnn_enabled(), "CLAP-DNN is not enabled"
 
     devices = devices[:4]
+    _, vendor, _ = _gpu_backend_info(devices[0])
 
     reference = torch.linspace(
         -4,
@@ -95,16 +125,16 @@ def _run_interleaved_cached_tensors(
                 expected,
             )
 
-    cudnn_calls = torch_paras._C.clap_dnn_backend_call_count("cuDNN")
+    backend_calls = torch_paras._C.clap_dnn_backend_call_count(vendor)
     fallbacks = torch_paras._C.clap_dnn_fallback_count()
     last_backend = torch_paras._C.clap_dnn_last_backend()
 
-    assert cudnn_calls == expected_calls, (
-        f"{name}: expected {expected_calls} cuDNN calls, got {cudnn_calls} "
+    assert backend_calls == expected_calls, (
+        f"{name}: expected {expected_calls} {vendor} calls, got {backend_calls} "
         f"(last_backend={last_backend!r}, fallbacks={fallbacks})"
     )
     assert fallbacks == 0
-    assert "cudnn" in last_backend.lower()
+    assert vendor.lower() in last_backend.lower()
 
 
 def test_clap_dnn_interleaved_cached_tensors(
@@ -255,7 +285,7 @@ def test_clap_dnn_input_limits_and_fallbacks(
             x_9d = torch.ones((2,) * 9, dtype=torch.float32, device=gpu_dev)
             with pytest.raises(
                 RuntimeError,
-                match="CLAP_DNN cuDNN: tensors must have rank 1..8",
+                match=r"CLAP_DNN .*: tensors must have rank 1..8",
             ):
                 _ = torch.sigmoid(x_9d).cpu()
     finally:
@@ -277,9 +307,16 @@ def test_clap_dnn_backend_override_validation(
         _skip("oneDNN runtime (libdnnl.so) is not in LD_LIBRARY_PATH")
         return
 
-    matching_env = "CUDA" if is_gpu else "CPU"
-    mismatched_env = "CPU" if is_gpu else "CUDA"
-    expected_vendor = "cuDNN" if is_gpu else "oneDNN"
+    if is_gpu:
+        gpu_env, gpu_vendor, gpu_cli = _gpu_backend_info(device)
+        matching_env = gpu_env
+        mismatched_env = "CPU"
+        expected_vendor = gpu_vendor
+    else:
+        gpu_cli = "-cuda"
+        matching_env = "CPU"
+        mismatched_env = "CUDA"
+        expected_vendor = "oneDNN"
 
     x_cpu = torch.linspace(-2.0, 2.0, 16, dtype=torch.float32).reshape(4, 4)
     x_dev = x_cpu.to(device)
@@ -305,8 +342,8 @@ def test_clap_dnn_backend_override_validation(
         else:
             os.environ.pop("CLAP_BACKEND", None)
 
-    mismatched_cli = "-cpu" if is_gpu else "-cuda"
-    matching_cli = "-cuda" if is_gpu else "-cpu"
+    mismatched_cli = "-cpu" if is_gpu else gpu_cli
+    matching_cli = gpu_cli if is_gpu else "-cpu"
 
     code = (
         "import json, torch, torch_paras; "
